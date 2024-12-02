@@ -1,0 +1,201 @@
+name: update main.tf
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    
+
+jobs:
+  scan:
+      runs-on: ubuntu-latest
+
+      steps:
+        - name: Analyze with SonarCloud
+          uses: SonarSource/sonarcloud-github-action@4006f663ecaf1f8093e8e4abb9227f6041f52216
+          env:
+            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          with:
+
+            args:
+              -Dsonar.projectKey=neakoh_cicd-project-frontend
+              -Dsonar.organization=neakoh
+            projectBaseDir: .        
+  build:
+    runs-on: ubuntu-latest
+    needs: scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli curl
+
+      - name: Build Docker image
+        run: |
+          echo "Building Docker image..."
+          docker build -t basic-blog:latest .
+
+      - name: Run Trivy scan on Docker image
+        run: |
+          echo "Running Trivy scan on Docker image"
+          curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -
+          export PATH=$PATH:$(pwd)/bin
+          trivy image --exit-code 0 --severity HIGH,CRITICAL basic-blog:latest || true
+          trivy image --format json --output trivy-results.json basic-blog:latest
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-2
+
+      - name: Log in to Amazon ECR
+        run: |
+          echo "Logging in to Amazon ECR..."
+          echo aws-region
+          aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin 851725435775.dkr.ecr.eu-west-2.amazonaws.com
+
+      - name: Push Docker image to ECR
+        run: |
+          echo "Pushing Docker image to ECR..."
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          IMAGE_TAG="basic-blog:$TIMESTAMP"
+          docker tag basic-blog:latest 851725435775.dkr.ecr.eu-west-2.amazonaws.com/$IMAGE_TAG
+          docker push 851725435775.dkr.ecr.eu-west-2.amazonaws.com/$IMAGE_TAG
+          echo "IMAGE_URI=851725435775.dkr.ecr.eu-west-2.amazonaws.com/$IMAGE_TAG" >> tfvars.env
+
+      - name: Check tfvars.env file
+        run: |
+          echo "Checking if tfvars.env file is created..."
+          if [ -f tfvars.env ]; then
+            echo "tfvars.env file exists. Contents:"
+            cat tfvars.env
+          else
+            echo "tfvars.env file does not exist."
+            exit 1  # Fail the job if the file does not exist
+          fi
+
+      - name: Upload tfvars.env as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfvars
+          path: tfvars.env
+
+  fetch-outputs:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download tfvars.env artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: tfvars
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+
+      - name: Fetch Terraform outputs
+        run: |
+          echo "Creating variables for specific outputs..."
+          # Construct the URL
+          URL="https://app.terraform.io/api/v2/workspaces/${{ secrets.HCP_WORKSPACE_ID }}/current-state-version-outputs"
+          # Print the URL
+          echo "Fetching from URL: $URL"
+          # Execute the curl command
+          curl -s -X GET "$URL" \
+            --ssl-no-revoke \
+            -H "Authorization: Bearer ${{ secrets.HCP_TOKEN }}" \
+            -H 'Content-Type: application/vnd.api+json' | \
+            jq -r '.data[] | select(.attributes.name | test("public_subnet_ids|alb-sg-id|container-sg-id|vpc_id")) | 
+            if .attributes.name == "public_subnet_ids" then
+              "PUBLIC_SUBNET_IDS=\(.attributes.value)"
+            elif .attributes.name == "alb-sg-id" then
+              "ALB_SG_ID=\(.attributes.value)"
+            elif .attributes.name == "container-sg-id" then
+              "CONTAINER_SG_ID=\(.attributes.value)"
+            elif .attributes.name == "vpc_id" then
+              "VPC_ID=\(.attributes.value)"
+            else
+              empty
+            end' >> tfvars.env
+
+      - name: Display tfvars.env contents
+        run: cat tfvars.env
+
+      - name: Upload terraform_outputs.env as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: tfvars
+          path: tfvars.env
+
+  update-terraform:
+    runs-on: ubuntu-latest
+    needs: fetch-outputs
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download tfvars.env artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: tfvars
+
+      - name: Check tfvars.env contents
+        run: |
+          echo "Contents of tfvars.env:"
+          cat tfvars.env
+
+      - name: Load env file
+        run: |
+          cat tfvars.env >> $GITHUB_ENV
+          sed -i 's/^/export /' tfvars.env
+          source tfvars.env
+
+      - name: Verify loaded variables
+        run: |
+          echo "Verifying loaded environment variables..."
+          echo "IMAGE_URI: $IMAGE_URI"
+          echo "PUBLIC_SUBNET_IDS: $PUBLIC_SUBNET_IDS"
+          echo "ALB_SG_ID: $ALB_SG_ID"
+          echo "CONTAINER_SG_ID: $CONTAINER_SG_ID"
+          echo "VPC_ID: $VPC_ID"
+
+      - name: Create terraform.tfvars file
+        run: |
+          echo "Creating terraform.tfvars file..."
+          cat << EOF > terraform.tfvars
+          image_uri = "${IMAGE_URI}"
+          public_subnet_ids = ${PUBLIC_SUBNET_IDS}
+          alb_sg_id = "${ALB_SG_ID}"
+          container_sg_id = "${CONTAINER_SG_ID}"
+          vpc_id = "${VPC_ID}"
+          EOF
+
+      - name: Set up Git
+        run: |
+          git config --global user.email "your-email@example.com"  # Replace with your email
+          git config --global user.name "your-github-username"  # Replace with your GitHub username
+
+      - name: Commit and push terraform.tfvars
+        run: |
+          git add terraform.tfvars
+          git commit -m "Update terraform.tfvars with outputs from Terraform Cloud [ci skip]" || echo "No changes to commit"
+          
+          # Create a new tag with the current date and time
+          TAG_NAME="$(date +%Y.%m.%d-%H%M%S)"
+          echo "Creating a new tag $TAG_NAME"
+          git tag -a $TAG_NAME -m "Release version $TAG_NAME [ci skip]"
+          
+          # Push the commit and the tag
+          git push origin HEAD:main --tags || exit 1
