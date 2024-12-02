@@ -1,7 +1,7 @@
 # Front-End Infrastructure and CI/CD Pipeline (Repo 2)
 
 ## Overview
-This repository defines the AWS front-end infrastructure, CI/CD pipeline, application code, and the associated Sentinel policies for each component. It builds upon the infrastructure defined in **Repo 1**.
+This repository defines the AWS front-end infrastructure, CI/CD pipeline, application code, and the associated Sentinel policies for each component. It builds upon the infrastructure defined in **[Repo 1](https://github.com/neakoh/awscicd-v1-backend)**
 
 ### Project Focus
 The primary focus of this project was not on the application code or the Lambda function. As such, there are several improvements that could be made, such as implementing HTTPS into the Application Load Balancer (ALB). Currently, inbound traffic to the ALB is over HTTP. Practical use of TLS certificates is demonstrated in a static site CloudFront distribution in a different project.
